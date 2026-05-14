@@ -3,19 +3,20 @@
 AAMVA Forensic Tool — Localhost Web UI
 Run:  python app.py
 Open: http://localhost:8000
+
+Multipart parsing uses the stdlib `email` package (Python 3.0+) instead of
+the deprecated `cgi` module (removed in Python 3.13).
 """
 import io
 import sys
 import json
-import base64
-import textwrap
 import traceback
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-import cgi
 import tempfile
 import os
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from email import message_from_bytes
+from email.policy import HTTP as HTTPPolicy
 
 # ── bootstrap deps ────────────────────────────────────────────────
 for pkg, name in [('PIL', 'Pillow'), ('pdf417decoder', 'pdf417decoder')]:
@@ -32,22 +33,43 @@ from aamva_forensic import (
     unescape_tilde,
     detect_encoding_mode,
     parse_subfiles,
-    analyse_mandatory_fields,
-    analyse_dates,
-    analyse_field_values,
-    analyse_header_bytes,
     AAMVA_IIN_MAP,
     DMV_FIELD_LABELS,
     VALID_SEX, VALID_EYE_CODES, VALID_HAIR_CODES,
     VALID_TRUNCATION, VALID_COMPLIANCE,
     _state_abbr_to_name,
-    _ver_year,
+    AAMVA_MANDATORY_FIELDS,
 )
 import re
 from datetime import datetime
 
 PORT = 8000
 TEMPLATES = Path(__file__).parent / 'templates'
+
+
+# ── multipart parser (no cgi dependency) ─────────────────────────
+def parse_multipart(content_type: str, body: bytes) -> list:
+    """
+    Parse multipart/form-data body without the deprecated `cgi` module.
+    Returns list of (filename, file_bytes) tuples for every uploaded file.
+    """
+    # Build a minimal RFC-2822 message so email.message_from_bytes can parse it
+    raw = b'Content-Type: ' + content_type.encode() + b'\r\n\r\n' + body
+    msg = message_from_bytes(raw, policy=HTTPPolicy)
+    files = []
+    for part in msg.walk():
+        cd = part.get('Content-Disposition', '')
+        if 'filename' not in cd:
+            continue
+        # extract filename from Content-Disposition
+        fname = None
+        for token in cd.split(';'):
+            token = token.strip()
+            if token.lower().startswith('filename='):
+                fname = token.split('=', 1)[1].strip().strip('"')
+        if fname:
+            files.append((fname, part.get_payload(decode=True) or b''))
+    return files
 
 
 def analyse_card(path: str, label: str) -> dict:
@@ -79,7 +101,7 @@ def analyse_card(path: str, label: str) -> dict:
     try:
         raw = decode_image(path, label)
         if not raw:
-            result['error'] = 'Could not decode barcode from image'
+            result['error'] = 'Could not decode barcode from image (zbar/pdf417decoder found no PDF417 symbol)'
             return result
 
         mode = detect_encoding_mode(raw)
@@ -87,7 +109,6 @@ def analyse_card(path: str, label: str) -> dict:
         normalised = unescape_tilde(raw) if '~' in raw else raw
         result['raw_preview'] = repr(normalised[:400])
 
-        # header bytes
         b0 = ord(normalised[0]) if len(normalised) > 0 else 0
         b1 = ord(normalised[1]) if len(normalised) > 1 else 0
         b2 = ord(normalised[2]) if len(normalised) > 2 else 0
@@ -95,7 +116,6 @@ def analyse_card(path: str, label: str) -> dict:
         header_ok = (b0 == 0x40 and b1 == 0x0A and b2 == 0x1E and b3 == 0x0D)
         result['header_ok'] = header_ok
 
-        # parse
         parsed = parse_subfiles(normalised)
         result['iin']             = parsed.get('iin', '')
         result['aamva_ver']       = parsed.get('aamva_ver', 0)
@@ -121,14 +141,11 @@ def analyse_card(path: str, label: str) -> dict:
             for k, v in sorted(fields.items())
         }
 
-        # mandatory fields
         ver = min(max(result['aamva_ver'], 1), 10)
-        from aamva_forensic import AAMVA_MANDATORY_FIELDS
         mandatory = AAMVA_MANDATORY_FIELDS.get(ver, AAMVA_MANDATORY_FIELDS[8])
         missing = [t for t in mandatory if t not in fields]
         result['missing_mandatory'] = missing
 
-        # field value errors
         errs = []
         def chk(tag, valid_set):
             val = fields.get(tag, '').strip()
@@ -149,12 +166,10 @@ def analyse_card(path: str, label: str) -> dict:
             errs.append(f'DAK={repr(dak)} invalid ZIP format (expected 11 chars)')
         result['field_errors'] = errs
 
-        # dates
         today = datetime.today()
         date_rows = []
         for tag, lbl in [('DBB','DOB'), ('DBD','Issue Date'), ('DBA','Expiry'),
-                         ('DDB','Under-18/Prior'), ('DDH','Under-18'),
-                         ('DDJ','Under-21')]:
+                         ('DDB','Under-18/Prior'), ('DDH','Under-18'), ('DDJ','Under-21')]:
             val = fields.get(tag)
             if not val:
                 continue
@@ -170,11 +185,11 @@ def analyse_card(path: str, label: str) -> dict:
                 if tag == 'DBB':
                     extra = f'Age {(today-dt).days//365}'
                 elif tag == 'DBA':
-                    extra = 'Valid' if dt > today else '⚠ EXPIRED'
-                date_rows.append({'tag': tag, 'label': lbl, 'date': dt.strftime('%b %d, %Y'), 'note': extra})
+                    extra = 'Valid' if dt > today else '\u26a0 EXPIRED'
+                date_rows.append({'tag': tag, 'label': lbl,
+                                  'date': dt.strftime('%b %d, %Y'), 'note': extra})
         result['dates'] = date_rows
 
-        # verdict checks
         iin_ok = result['iin'] in AAMVA_IIN_MAP
         state_code = fields.get('DAJ', '').strip()
         iin_state_match = (
@@ -195,7 +210,7 @@ def analyse_card(path: str, label: str) -> dict:
             ('Binary header (0x40 0x0A 0x1E 0x0D)',  header_ok),
             ('IIN registered in AAMVA',               iin_ok),
             ('IIN state matches DAJ field',           iin_state_match),
-            ('AAMVA version 01–10',                   1 <= result['aamva_ver'] <= 10),
+            ('AAMVA version 01\u201310',              1 <= result['aamva_ver'] <= 10),
             ('DL subfile present',                    result['dl_subfile_found']),
             ('Subfile byte offsets valid',             result['offsets_valid']),
             ('All mandatory fields present',          len(missing) == 0),
@@ -212,7 +227,7 @@ def analyse_card(path: str, label: str) -> dict:
         result['verdict_failed'] = failed
         result['status'] = 'authentic' if failed == 0 else ('warn' if failed <= 2 else 'fail')
 
-    except Exception as e:
+    except Exception:
         result['error'] = traceback.format_exc()
         result['status'] = 'error'
 
@@ -225,48 +240,57 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ('/', '/index.html'):
-            html = (TEMPLATES / 'index.html').read_text()
-            self.respond(200, 'text/html; charset=utf-8', html.encode())
+            html = (TEMPLATES / 'index.html').read_text(encoding='utf-8')
+            self.respond(200, 'text/html; charset=utf-8', html.encode('utf-8'))
         else:
             self.respond(404, 'text/plain', b'Not found')
 
     def do_POST(self):
         if self.path == '/analyse':
-            ctype, pdict = cgi.parse_header(self.headers.get('Content-Type', ''))
-            if ctype != 'multipart/form-data':
+            content_type = self.headers.get('Content-Type', '')
+            if 'multipart/form-data' not in content_type:
                 self.respond(400, 'application/json',
                              json.dumps({'error': 'Expected multipart/form-data'}).encode())
                 return
-            pdict['boundary'] = pdict.get('boundary', '').encode()
+
             length = int(self.headers.get('Content-Length', 0))
-            data = self.rfile.read(length)
-            form = cgi.FieldStorage(
-                fp=io.BytesIO(data),
-                headers=self.headers,
-                environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type']}
-            )
-            files = form.getlist('files')
+            body = self.rfile.read(length)
+
+            try:
+                uploaded = parse_multipart(content_type, body)
+            except Exception as e:
+                self.respond(400, 'application/json',
+                             json.dumps({'error': f'Multipart parse error: {e}'}).encode())
+                return
+
+            if not uploaded:
+                self.respond(400, 'application/json',
+                             json.dumps({'error': 'No files received — check form field name is "files"'}).encode())
+                return
+
             results = []
-            for i, f in enumerate(files):
-                if not hasattr(f, 'filename') or not f.filename:
-                    continue
-                suffix = Path(f.filename).suffix or '.jpg'
+            for fname, fbytes in uploaded:
+                suffix = Path(fname).suffix or '.jpg'
                 with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                    tmp.write(f.file.read())
+                    tmp.write(fbytes)
                     tmp_path = tmp.name
                 try:
-                    r = analyse_card(tmp_path, f.filename)
+                    r = analyse_card(tmp_path, fname)
                 finally:
-                    os.unlink(tmp_path)
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
                 results.append(r)
+
             self.respond(200, 'application/json', json.dumps(results).encode())
         else:
             self.respond(404, 'application/json', b'{"error":"not found"}')
 
-    def respond(self, code, ctype, body: bytes):
+    def respond(self, code: int, ctype: str, body: bytes):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', len(body))
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(body)
@@ -274,6 +298,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     TEMPLATES.mkdir(exist_ok=True)
-    print(f'\n🔍  AAMVA Forensic Tool  — http://localhost:{PORT}')
+    print(f'\n\U0001f50d  AAMVA Forensic Tool  \u2014 http://localhost:{PORT}')
     print(f'    Press Ctrl+C to stop\n')
     HTTPServer(('localhost', PORT), Handler).serve_forever()

@@ -4,19 +4,21 @@ AAMVA Forensic Tool — Localhost Web UI
 Run:  python app.py
 Open: http://localhost:8000
 
-Multipart parsing uses the stdlib `email` package (Python 3.0+) instead of
-the deprecated `cgi` module (removed in Python 3.13).
+Multipart parsing uses a hand-rolled boundary parser so we depend on
+zero third-party libs beyond Pillow + pdf417decoder.
 """
+from __future__ import annotations
+
 import io
 import sys
 import json
 import traceback
 import tempfile
 import os
+import re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from email import message_from_bytes
-from email.policy import HTTP as HTTPPolicy
+from datetime import datetime
 
 # ── bootstrap deps ────────────────────────────────────────────────
 for pkg, name in [('PIL', 'Pillow'), ('pdf417decoder', 'pdf417decoder')]:
@@ -40,35 +42,55 @@ from aamva_forensic import (
     _state_abbr_to_name,
     AAMVA_MANDATORY_FIELDS,
 )
-import re
-from datetime import datetime
 
 PORT = 8000
 TEMPLATES = Path(__file__).parent / 'templates'
 
 
-# ── multipart parser (no cgi dependency) ─────────────────────────
+# ── multipart parser (pure stdlib, no cgi/email.policy dependency) ────
 def parse_multipart(content_type: str, body: bytes) -> list:
     """
-    Parse multipart/form-data body without the deprecated `cgi` module.
+    Parse multipart/form-data body without the deprecated `cgi` module
+    and without relying on email.policy (which behaves inconsistently).
+
     Returns list of (filename, file_bytes) tuples for every uploaded file.
     """
-    # Build a minimal RFC-2822 message so email.message_from_bytes can parse it
-    raw = b'Content-Type: ' + content_type.encode() + b'\r\n\r\n' + body
-    msg = message_from_bytes(raw, policy=HTTPPolicy)
+    # Extract boundary from Content-Type header
+    # e.g.  multipart/form-data; boundary=----WebKitFormBoundaryXYZ
+    m = re.search(r'boundary=([^;\s]+)', content_type, re.IGNORECASE)
+    if not m:
+        return []
+    boundary = m.group(1).strip('"')
+    delimiter = ('--' + boundary).encode()
+    end_delimiter = ('--' + boundary + '--').encode()
+
     files = []
-    for part in msg.walk():
-        cd = part.get('Content-Disposition', '')
-        if 'filename' not in cd:
+    # Split body on boundary markers
+    parts = body.split(delimiter)
+    for part in parts:
+        part = part.lstrip(b'\r\n')
+        if part in (b'--\r\n', b'--\r\n', b'--', b'') or part.startswith(b'--'):
+            continue  # closing delimiter or preamble
+        # Separate headers from body (blank line = \r\n\r\n)
+        if b'\r\n\r\n' not in part:
             continue
-        # extract filename from Content-Disposition
-        fname = None
-        for token in cd.split(';'):
-            token = token.strip()
-            if token.lower().startswith('filename='):
-                fname = token.split('=', 1)[1].strip().strip('"')
+        raw_headers, _, file_body = part.partition(b'\r\n\r\n')
+        # Strip trailing \r\n added by boundary delimiter
+        file_body = file_body.rstrip(b'\r\n')
+
+        headers_text = raw_headers.decode('utf-8', errors='replace')
+
+        # Only process parts that have a filename (i.e. file uploads)
+        fname_match = re.search(
+            r'Content-Disposition:[^\n]*filename=["\']?([^"\'\r\n;]+)',
+            headers_text, re.IGNORECASE
+        )
+        if not fname_match:
+            continue
+        fname = fname_match.group(1).strip()
         if fname:
-            files.append((fname, part.get_payload(decode=True) or b''))
+            files.append((fname, file_body))
+
     return files
 
 
@@ -298,6 +320,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     TEMPLATES.mkdir(exist_ok=True)
-    print(f'\n\U0001f50d  AAMVA Forensic Tool  \u2014 http://localhost:{PORT}')
+    print(f'\n\U0001f50d  AAMVA Forensic Tool  \u2014  http://localhost:{PORT}')
     print(f'    Press Ctrl+C to stop\n')
     HTTPServer(('localhost', PORT), Handler).serve_forever()

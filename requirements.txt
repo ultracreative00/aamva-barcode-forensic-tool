@@ -1,3 +1,2 @@
-pdf417decoder
 Pillow
-numpy
+pdf417decoder

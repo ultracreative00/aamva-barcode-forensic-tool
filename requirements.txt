@@ -1,0 +1,3 @@
+pdf417decoder
+Pillow
+numpy

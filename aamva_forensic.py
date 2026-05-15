@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-AAMVA PDF417 Barcode Forensic & Authenticity Tool  v2.0
+AAMVA PDF417 Barcode Forensic & Authenticity Tool  v3.0
 ========================================================
 Full AAMVA DL/ID Card Design Standard 2000–2020 compliance.
 Supports AAMVA versions 01–10, all 50 states + DC + territories.
+
+Reference Benchmark: NC AAMVA v08 barcode (32 fields, binary header).
+Tilde-escape encoding is treated as a hard FAIL — authentic barcodes
+must contain raw binary bytes 0x40 0x0A 0x1E 0x0D as the header.
 
 Usage:
   python aamva_forensic.py                          # card1.jpg + card2.jpg in CWD
   python aamva_forensic.py --card1 a.jpg --card2 b.jpg
   python aamva_forensic.py --raw-only               # use embedded raw strings
-  python aamva_forensic.py --raw-only --card1-raw "@..." --card2-raw "@..."
 """
 
 import argparse
@@ -51,15 +54,13 @@ AAMVA_IIN_MAP: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# AAMVA VERSION → mandatory DL fields (v5+)
+# AAMVA VERSION → mandatory DL fields
 # ---------------------------------------------------------------------------
 AAMVA_MANDATORY_FIELDS: dict[int, list[str]] = {
-    # v1–v4: minimal set
     1: ['DAQ','DCS','DAC','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK'],
     2: ['DAQ','DCS','DAC','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK'],
     3: ['DAQ','DCS','DAC','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK'],
     4: ['DAQ','DCS','DAC','DAD','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK'],
-    # v5+ full mandatory set
     5: ['DAQ','DCS','DAC','DAD','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK',
         'DCA','DCB','DCD','DCF','DCG','DDE','DDF','DDG'],
     6: ['DAQ','DCS','DAC','DAD','DBB','DBA','DBD','DBC','DAU','DAY','DAG','DAI','DAJ','DAK',
@@ -75,39 +76,135 @@ AAMVA_MANDATORY_FIELDS: dict[int, list[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# TRUNCATION / ENUM VALIDATION TABLES
+# VALIDATION TABLES
 # ---------------------------------------------------------------------------
-VALID_TRUNCATION = {'N', 'T', 'U'}       # DDE / DDF / DDG
-VALID_SEX        = {'1', '2', '9'}       # DBC: 1=M 2=F 9=Not specified
-VALID_COMPLIANCE = {'F', 'N', 'U'}       # DDA: Full / Not compliant / Unknown
-VALID_EYE_CODES  = {'BLK','BLU','BRO','GRY','GRN','HAZ','MAR','PNK','DIC','UNK'}
-VALID_HAIR_CODES = {'BAL','BLK','BLN','BRO','GRY','RED','SDY','WHI','UNK'}
+VALID_TRUNCATION  = {'N', 'T', 'U'}
+VALID_SEX         = {'1', '2', '9'}
+VALID_COMPLIANCE  = {'F', 'N', 'U'}
+VALID_EYE_CODES   = {'BLK','BLU','BRO','GRY','GRN','HAZ','MAR','PNK','DIC','UNK'}
+VALID_HAIR_CODES  = {'BAL','BLK','BLN','BRO','GRY','RED','SDY','WHI','UNK'}
+VALID_ORGAN_DONOR = {'0', '1'}           # DDK: 0=No, 1=Yes
+VALID_VETERAN     = {'1', '2', '9', ''}  # DDL: 1=Veteran, 2=Non-veteran, 9=N/A
+VALID_RACE_CODES  = {                    # DCL: AAMVA race/ethnicity codes
+    'AI',  # American Indian or Alaska Native
+    'AP',  # Asian or Pacific Islander
+    'BK',  # Black
+    'H',   # Hispanic Origin
+    'O',   # Not Applicable / Other
+    'U',   # Unknown
+    'W',   # White
+}
 
-# ---------------------------------------------------------------------------
-# DMV FIELD LABELS
-# ---------------------------------------------------------------------------
-DMV_FIELD_LABELS: dict[str, str] = {
-    'DAQ': 'Driver License Number',    'DCS': 'Last Name',
-    'DAC': 'First Name',               'DAD': 'Middle Name',
-    'DBB': 'Date of Birth (DOB)',       'DBA': 'Expiry Date',
-    'DBD': 'Issue Date',               'DDB': 'Under-18 Until / Prior Issue Date',
-    'DBC': 'Sex (1=M 2=F 9=N/A)',      'DAU': 'Height',
-    'DAY': 'Eye Colour',               'DAZ': 'Hair Colour',
-    'DAG': 'Street Address',           'DAI': 'City',
-    'DAJ': 'State/Province',           'DAK': 'ZIP/Postal Code (11 chars)',
-    'DCA': 'Vehicle Class',            'DCB': 'Restrictions',
-    'DCD': 'Endorsements',             'DCF': 'Document Discriminator',
-    'DCG': 'Country ID',               'DCK': 'Inventory Control Number',
-    'DCL': 'Race/Ethnicity',           'DDA': 'Compliance Type',
-    'DDC': 'Hazmat Expiry',            'DDE': 'Last Name Truncation (N/T/U)',
-    'DDF': 'First Name Truncation (N/T/U)', 'DDG': 'Middle Name Truncation (N/T/U)',
-    'DDH': 'Under 18 Until',           'DDI': 'Under 19 Until',
-    'DDJ': 'Under 21 Until',           'DDK': 'Organ Donor',
-    'DDL': 'Veteran Indicator',
+# DCK vendor codes
+DCK_VENDOR_MAP = {
+    'TL': 'Idemia/L1',
+    'DL': 'Digimarc',
+    'HO': 'HID Global',
+    'DM': 'DataCard',
+    'PC': 'Polaroid',
+    'DE': 'De La Rue',
+    'AM': 'American Banknote',
+    'GP': 'Giesecke+Devrient',
+}
+
+# NC jurisdiction (IIN 636004) ZN subfile field meanings
+NC_ZN_FIELDS = {
+    'ZNA': 'NC Replacement Indicator (blank=original)',
+    'ZNB': 'NC Limited-Term Indicator (blank=full-term)',
+    'ZNC': 'NC Under-21 Indicator (0=No, 1=Yes)',
+    'ZND': 'NC Non-Resident CDL (N=not CDL, Y=CDL)',
+    'ZNE': 'NC Selective Service (Y/N)',
+    'ZNF': 'NC Veteran Indicator (Y/N)',
+    'ZNG': 'NC Medical Indicator',
+    'ZNH': 'NC Volunteer Fire/Rescue',
+    'ZNI': 'NC Non-Compliant Reason',
+    'ZNJ': 'NC Audit Number Suffix',
+    'ZNK': 'NC Customer Sequence',
 }
 
 # ---------------------------------------------------------------------------
-# EMBEDDED RAW STRINGS
+# COMPLETE DMV FIELD LABELS — all fields from reference barcode + AAMVA spec
+# ---------------------------------------------------------------------------
+DMV_FIELD_LABELS: dict[str, str] = {
+    # Identity
+    'DAQ': 'Driver License / ID Number',
+    'DCS': 'Last Name (Family Name)',
+    'DAC': 'First Name (Given Name)',
+    'DAD': 'Middle Name or Initial',
+    # Dates
+    'DBB': 'Date of Birth (MMDDYYYY)',
+    'DBA': 'Document Expiry Date (MMDDYYYY)',
+    'DBD': 'Document Issue Date (MMDDYYYY)',
+    'DDB': 'Card Revision / Prior Issue Date (MMDDYYYY)',
+    'DDH': 'Under 18 Until (MMDDYYYY)',
+    'DDI': 'Under 19 Until (MMDDYYYY)',
+    'DDJ': 'Under 21 Until (MMDDYYYY)',
+    # Physical
+    'DBC': 'Sex (1=Male, 2=Female, 9=Not Specified)',
+    'DAU': 'Height (NNN in | NNN cm)',
+    'DAY': 'Eye Colour (AAMVA 3-char code)',
+    'DAZ': 'Hair Colour (AAMVA 3-char code)',
+    'DAW': 'Weight (lbs)',
+    'DAX': 'Weight Range',
+    # Address
+    'DAG': 'Street Address Line 1',
+    'DAH': 'Street Address Line 2',
+    'DAI': 'City',
+    'DAJ': 'State / Province Abbreviation',
+    'DAK': 'ZIP / Postal Code (fixed 11 chars: 9 digits + 2 spaces)',
+    'DCG': 'Country Identifier (USA/CAN/MEX)',
+    # License class / restrictions
+    'DCA': 'Vehicle Class',
+    'DCB': 'Restriction Codes',
+    'DCD': 'Endorsement Codes',
+    # Document metadata
+    'DCF': 'Document Discriminator (unique per document)',
+    'DCK': 'Inventory Control Number / Audit Number (20 chars)',
+    'DCL': 'Race / Ethnicity (3-char fixed-width)',
+    'DDA': 'Compliance Type (F=Full, N=Non-compliant, U=Unknown)',
+    # Truncation flags
+    'DDE': 'Last Name Truncation (N=No, T=Truncated, U=Unknown)',
+    'DDF': 'First Name Truncation (N=No, T=Truncated, U=Unknown)',
+    'DDG': 'Middle Name Truncation (N=No, T=Truncated, U=Unknown)',
+    # Optional / supplemental
+    'DDC': 'Hazmat Endorsement Expiry Date',
+    'DDK': 'Organ Donor Indicator (0=No, 1=Yes)',
+    'DDL': 'Veteran Indicator (1=Vet, 2=Non-vet, 9=N/A)',
+    'DCH': 'Federal Commercial Vehicle Codes',
+    'DCM': 'AAMVA Version Number (inside subfile)',
+    'DCN': 'Jurisdiction-specific Vehicle Class',
+    'DCO': 'Permit Classification Code',
+    'DCP': 'Permit Expiration Date',
+    'DCQ': 'Permit Identifier',
+    'DCR': 'Permit Issue Date',
+    'DCS': 'Last Name (Family Name)',  # duplicate for clarity
+    'DCU': 'Name Suffix (JR/SR/I/II/III)',
+    'DAB': 'Last Name (old v1 alias)',
+    'DAE': 'Name Suffix (old v1 alias)',
+    'DAF': 'Name Prefix (old v1 alias)',
+    'DAN': 'Alias / AKA Last Name',
+    'DAO': 'Alias / AKA First Name',
+    'DAP': 'Alias / AKA Middle Name',
+    'DAR': 'License Classification Code (v1)',
+    'DAS': 'Restriction Code (v1)',
+    'DAT': 'Endorsement Code (v1)',
+    'DAV': 'Height in CM (v1)',
+    # NC jurisdiction subfile
+    'ZNA': 'NC Replacement Indicator',
+    'ZNB': 'NC Limited-Term Indicator',
+    'ZNC': 'NC Under-21 Indicator (0=No, 1=Yes)',
+    'ZND': 'NC Non-Resident CDL (N/Y)',
+    'ZNE': 'NC Selective Service',
+    'ZNF': 'NC Veteran Indicator',
+    'ZNG': 'NC Medical Indicator',
+    'ZNH': 'NC Volunteer Fire/Rescue',
+    'ZNI': 'NC Non-Compliant Reason',
+    'ZNJ': 'NC Audit Number Suffix',
+    'ZNK': 'NC Customer Sequence',
+}
+
+# ---------------------------------------------------------------------------
+# EMBEDDED RAW STRINGS  (reference barcode = CARD1, tilde-escaped = CARD2)
 # ---------------------------------------------------------------------------
 CARD1_RAW_EMBEDDED = (
     '@\n\x1e\rANSI 636004080002DL00410271ZN03120020'
@@ -135,25 +232,21 @@ CARD2_RAW_EMBEDDED = (
 
 def ensure_zbar():
     if subprocess.run(['which', 'zbarimg'], capture_output=True).returncode != 0:
-        print('[setup] installing zbar-tools...')
-        subprocess.run('apt-get install -y zbar-tools libzbar0 2>&1 | tail -5',
+        subprocess.run('apt-get install -y zbar-tools libzbar0 2>&1 | tail -3',
                        shell=True, capture_output=True, text=True)
 
 def ensure_pdf417decoder():
     try:
         import pdf417decoder  # noqa
     except ImportError:
-        print('[setup] installing pdf417decoder...')
         subprocess.run([sys.executable, '-m', 'pip', 'install', 'pdf417decoder', '-q'])
 
-def decode_with_zbar(path: str, label: str) -> bytes | None:
+def _decode_zbar(path: str, label: str) -> bytes | None:
     r = subprocess.run(['zbarimg', '--raw', '-q', path], capture_output=True)
     print(f'  zbarimg {label}: RC={r.returncode} bytes={len(r.stdout)}')
-    if r.stderr:
-        print(f'  zbarimg stderr: {r.stderr.decode()[:200]}')
     return r.stdout if r.returncode == 0 and r.stdout else None
 
-def decode_with_preprocessing(path: str, label: str) -> bytes | None:
+def _decode_preprocessed(path: str, label: str) -> bytes | None:
     try:
         from PIL import Image, ImageEnhance, ImageFilter
         import numpy as np
@@ -162,44 +255,40 @@ def decode_with_preprocessing(path: str, label: str) -> bytes | None:
     img = Image.open(path).convert('L')
     w, h = img.size
     scale = max(1, 1200 // w)
-    upscaled = img.resize((w * scale, h * scale), Image.LANCZOS)
-    arr = np.array(upscaled)
-    binary = ((arr > arr.mean()) * 255).astype('uint8')
-    proc_path = f'/tmp/{label}_proc.png'
-    Image.fromarray(binary).save(proc_path)
-    enhanced = ImageEnhance.Contrast(img).enhance(3.0).filter(ImageFilter.SHARPEN)
-    s1_path  = f'/tmp/{label}_s1.png'
-    enhanced.save(s1_path)
-    inv_path = f'/tmp/{label}_inv.png'
-    Image.fromarray(255 - np.array(img)).save(inv_path)
-    for name, fpath in [('threshold', proc_path), ('enhanced', s1_path), ('inverted', inv_path)]:
-        r = subprocess.run(['zbarimg', '--raw', '-q', '--set', 'pdf417.enable=1', fpath],
+    up  = img.resize((w * scale, h * scale), Image.LANCZOS)
+    arr = np.array(up)
+    for name, proc in [
+        ('threshold', Image.fromarray(((arr > arr.mean()) * 255).astype('uint8'))),
+        ('enhanced',  ImageEnhance.Contrast(img).enhance(3.0).filter(ImageFilter.SHARPEN)),
+        ('inverted',  Image.fromarray(255 - arr)),
+    ]:
+        p = f'/tmp/{label}_{name}.png'
+        proc.save(p)
+        r = subprocess.run(['zbarimg', '--raw', '-q', '--set', 'pdf417.enable=1', p],
                            capture_output=True)
         print(f'    [{name}] RC={r.returncode} bytes={len(r.stdout)}')
         if r.returncode == 0 and r.stdout:
             return r.stdout
     return None
 
-def decode_with_pdf417decoder(path: str, label: str) -> bytes | None:
+def _decode_pdf417decoder(path: str, label: str) -> bytes | None:
     try:
         from pdf417decoder import PDF417Decoder
         from PIL import Image
     except ImportError:
         return None
-    img  = Image.open(path)
-    dec  = PDF417Decoder(img)
-    count = dec.decode()
-    print(f'  pdf417decoder {label}: {count} barcode(s) found')
-    if count == 0:
+    dec = PDF417Decoder(Image.open(path))
+    n = dec.decode()
+    print(f'  pdf417decoder {label}: {n} barcode(s)')
+    if n == 0:
         return None
-    for method in [
+    for fn in [
         lambda: dec.barcode_data_index_to_string(0).encode('latin-1'),
         lambda: (dec.barcodes_data[0] if isinstance(dec.barcodes_data[0], bytes)
                  else dec.barcodes_data[0].encode('latin-1')),
-        lambda: dec.barcode_binary_data,
     ]:
         try:
-            r = method()
+            r = fn()
             if r:
                 return r
         except Exception:
@@ -212,17 +301,16 @@ def decode_image(path: str, label: str) -> str | None:
         print(f'  ⚠  File not found: {path}')
         return None
     ensure_zbar()
-    raw = decode_with_zbar(path, label)
+    raw = _decode_zbar(path, label)
     if raw is None:
-        raw = decode_with_preprocessing(path, label)
+        raw = _decode_preprocessed(path, label)
     if raw is None:
         ensure_pdf417decoder()
-        raw = decode_with_pdf417decoder(path, label)
+        raw = _decode_pdf417decoder(path, label)
     if raw is None:
         print(f'  ✗  Could not decode {label}')
         return None
     decoded = raw.decode('latin-1')
-    print(f'\n--- RAW OUTPUT ({label}) ---')
     print(f'Bytes decoded: {len(raw)}')
     print(repr(decoded[:1200]))
     return decoded
@@ -233,129 +321,101 @@ def decode_image(path: str, label: str) -> str | None:
 # ===========================================================================
 
 def unescape_tilde(s: str) -> str:
-    """Convert ~XX (any case) escape sequences to actual characters."""
-    return re.sub(r'~([0-9a-fA-F]{2})',
-                  lambda m: chr(int(m.group(1), 16)), s)
+    return re.sub(r'~([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
 
 def detect_encoding_mode(raw: str) -> str:
-    """Detect whether control chars are raw binary or ~XX escaped."""
+    """
+    Detect encoding mode from the first 4 bytes of the raw barcode string.
+
+    AAMVA spec requires the header to be raw binary bytes:
+        0x40 ('@')  File Type
+        0x0A (LF)   Data Element Separator
+        0x1E (RS)   Record Separator
+        0x0D (CR)   Segment Terminator
+
+    If any of these are ASCII ~XX escape sequences instead of actual binary
+    bytes, the barcode was generated incorrectly (e.g. bwip-js with lowercase
+    escapes, or incorrect encoder configuration).
+
+    Returns: 'binary' | 'tilde_escape' | 'unknown'
+    """
     if len(raw) < 4:
         return 'unknown'
-    b1, b2, b3, b4 = ord(raw[0]), ord(raw[1]), ord(raw[2]), ord(raw[3])
-    if b1 == 0x40 and b2 == 0x0A and b3 == 0x1E and b4 == 0x0D:
+    b0, b1, b2, b3 = ord(raw[0]), ord(raw[1]), ord(raw[2]), ord(raw[3])
+    if b0 == 0x40 and b1 == 0x0A and b2 == 0x1E and b3 == 0x0D:
         return 'binary'
-    if raw[:10] == '@~0a~1e~0d' or raw[:10] == '@~0A~1E~0D':
+    # Check for ~XX tilde-escape (uppercase or lowercase)
+    tilde_pat = re.match(r'^@~([0-9a-fA-F]{2})~([0-9a-fA-F]{2})~([0-9a-fA-F]{2})', raw)
+    if tilde_pat:
         return 'tilde_escape'
     return 'unknown'
 
 def parse_subfiles(raw: str) -> dict:
-    """
-    Full AAMVA subfile parser:
-      1. Extract ANSI header
-      2. Parse subfile directory (offset+length table)
-      3. Extract each subfile by byte range
-      4. Parse fields within each subfile
-    Returns dict with keys: header_match, iin, aamva_ver, juris_ver,
-    subfiles (list of dicts), fields (merged), offsets_valid.
-    """
     result = {
-        'header_match': None,
-        'iin': '',
-        'aamva_ver': 0,
-        'juris_ver': 0,
-        'num_subfiles': 0,
-        'subfiles': [],
-        'fields': {},
-        'offsets_valid': True,
-        'dl_subfile_found': False,
+        'header_match': None, 'iin': '', 'aamva_ver': 0, 'juris_ver': 0,
+        'num_subfiles': 0, 'subfiles': [], 'fields': {},
+        'offsets_valid': True, 'dl_subfile_found': False,
     }
-
-    # Try v5+ header (has offset table)
     m = re.search(
-        r'ANSI (\d{6})(\d{2})(\d{2})(\d{2})'
-        r'((?:[A-Z]{2}\d{4}\d{4})+)',
-        raw
+        r'ANSI (\d{6})(\d{2})(\d{2})(\d{2})((?:[A-Z]{2}\d{4}\d{4})+)', raw
     )
     if m:
-        result['header_match'] = m.group(0)
-        result['iin']          = m.group(1)
-        result['aamva_ver']    = int(m.group(2))
-        result['juris_ver']    = int(m.group(3))
-        result['num_subfiles'] = int(m.group(4))
-
-        # Parse subfile directory entries
-        dir_str = m.group(5)
-        entries = re.findall(r'([A-Z]{2})(\d{4})(\d{4})', dir_str)
+        result.update({
+            'header_match': m.group(0),
+            'iin':          m.group(1),
+            'aamva_ver':    int(m.group(2)),
+            'juris_ver':    int(m.group(3)),
+            'num_subfiles': int(m.group(4)),
+        })
+        entries    = re.findall(r'([A-Z]{2})(\d{4})(\d{4})', m.group(5))
         header_end = m.end(0)
-
         for sf_id, sf_off, sf_len in entries:
-            off = int(sf_off)
+            off    = int(sf_off)
             length = int(sf_len)
-            # Validate byte range
-            actual_start = raw.find(sf_id, header_end)
-            within_range = abs(actual_start - off) <= 5 if actual_start != -1 else False
-            subfile_text = raw[actual_start:actual_start + length] if actual_start != -1 else ''
-            fields = _parse_fields(subfile_text)
-            sf_info = {
-                'id':       sf_id,
-                'declared_offset': off,
-                'declared_length': length,
-                'actual_start':    actual_start,
-                'offset_valid':    within_range,
-                'fields':          fields,
-            }
-            result['subfiles'].append(sf_info)
+            actual = raw.find(sf_id, header_end)
+            in_rng = abs(actual - off) <= 5 if actual != -1 else False
+            text   = raw[actual:actual + length] if actual != -1 else ''
+            fields = _parse_fields(text)
+            result['subfiles'].append({
+                'id': sf_id, 'declared_offset': off, 'declared_length': length,
+                'actual_start': actual, 'offset_valid': in_rng, 'fields': fields,
+            })
             result['fields'].update(fields)
             if sf_id == 'DL':
                 result['dl_subfile_found'] = True
-            if not within_range:
+            if not in_rng:
                 result['offsets_valid'] = False
     else:
-        # v1-v4 fallback — no offset table, just parse all fields
         m4 = re.search(r'ANSI (\d{6})(\d{2})(\d{2})', raw)
         if m4:
-            result['header_match'] = m4.group(0)
-            result['iin']       = m4.group(1)
-            result['aamva_ver'] = int(m4.group(2))
-            result['juris_ver'] = int(m4.group(3))
+            result.update({
+                'header_match': m4.group(0),
+                'iin':       m4.group(1),
+                'aamva_ver': int(m4.group(2)),
+                'juris_ver': int(m4.group(3)),
+            })
         result['fields'] = _parse_fields(raw)
-        result['dl_subfile_found'] = 'DAQ' in result['fields']  # infer
-
+        result['dl_subfile_found'] = 'DAQ' in result['fields']
     return result
 
 def _parse_fields(text: str) -> dict:
     """
-    Extract 3-char AAMVA field tags from a subfile block.
+    Extract AAMVA field tags from a subfile block.
 
-    FIX 1 — Subfile designator prefix:
-      Each subfile block starts with its 2-char type ID (e.g. "DL", "ZN")
-      immediately followed by the first field tag (e.g. "DAQ...").
-      The combined string "DLDAQ..." would be split as tag="DLD", value="AQ..."
-      which creates a phantom field and loses DAQ entirely.
-      Solution: strip the leading 2-char subfile designator before iterating.
+    FIX 1: Strip the 2-char subfile designator (e.g. 'DL', 'ZN') from the
+    start of the block — without this, 'DLDAQ...' is parsed as tag 'DLD'
+    and DAQ is never found.
 
-    FIX 2 — Preserve trailing spaces in fixed-width fields:
-      AAMVA §2.5 mandates fixed-width fields like DAK (11 chars = 9-digit ZIP
-      + 2 trailing spaces) and DCL (3 chars = code + padding spaces).
-      The previous line.strip() silently removed those spaces, causing
-      DAK='272622119  ' to become '272622119' (9 chars) and failing the
-      11-char ZIP validation, and DCL='U  ' to become 'U' (1 char).
-      Solution: only strip null bytes and line-ending characters (\r \n),
-      never strip spaces which are part of the field value.
+    FIX 2: Only strip null bytes and line terminators, NOT spaces.
+    Trailing spaces are mandatory data in fixed-width fields:
+      DAK = 11 chars (9-digit ZIP + 2 trailing spaces)
+      DCL = 3 chars  (race code + padding spaces)
     """
     fields: dict[str, str] = {}
-
-    # Strip the leading 2-char subfile type designator (e.g. "DL", "ZN").
-    # A subfile block always starts with its 2-char ID directly followed by
-    # the first 3-char field tag — e.g. "DLDAQ...", "ZNDDE...".
-    # We detect this by checking that the first 5 chars match [A-Z]{2}[A-Z]{2}[A-Z0-9].
+    # Strip 2-char subfile designator
     if len(text) >= 5 and re.match(r'^[A-Z]{2}[A-Z]{2}[A-Z0-9]', text):
         text = text[2:]
-
     for line in re.split(r'[\n\r\x1c\x1d\x1e]', text):
-        # Strip only null bytes and line-ending chars — NOT spaces.
-        # Trailing spaces are significant data in fixed-width AAMVA fields
-        # such as DAK (ZIP, 11 chars) and DCL (Race/Ethnicity, 3 chars).
         line = line.lstrip('\x00').rstrip('\r\n')
         if len(line) >= 3:
             tag = line[:3]
@@ -370,98 +430,94 @@ def _parse_fields(text: str) -> dict:
 # ===========================================================================
 
 def analyse_header_bytes(raw: str, label: str) -> tuple[bool, str]:
-    """Byte-level header check + encoding mode detection."""
+    """
+    Binary header check.
+    Tilde-escape mode is a hard FAIL — it means the barcode was generated
+    with an encoder that did not embed the required raw binary control bytes.
+    An authentic AAMVA barcode MUST have binary 0x0A, 0x1E, 0x0D.
+    """
     print(f'\n--- HEADER BYTES ({label}) ---')
     mode = detect_encoding_mode(raw)
-    print(f'  Encoding mode detected: {mode}')
-    b0 = ord(raw[0])     if len(raw) > 0 else 0
-    b1 = ord(raw[1])     if len(raw) > 1 else 0
-    b2 = ord(raw[2])     if len(raw) > 2 else 0
-    b3 = ord(raw[3])     if len(raw) > 3 else 0
-    print(f'  Byte 0 @ (0x40):  0x{b0:02X}  {"✅" if b0==0x40 else "❌"}')
-    print(f'  Byte 1 LF (0x0A): 0x{b1:02X}  {"✅ binary" if b1==0x0A else "❌ not binary 0x0A"}')
-    print(f'  Byte 2 RS (0x1E): 0x{b2:02X}  {"✅ binary" if b2==0x1E else "❌ not binary 0x1E"}')
-    print(f'  Byte 3 CR (0x0D): 0x{b3:02X}  {"✅ binary" if b3==0x0D else "❌ not binary 0x0D"}')
-    header_ok = (b0==0x40 and b1==0x0A and b2==0x1E and b3==0x0D)
-    print(f'  Header binary: {"✅ CORRECT" if header_ok else "❌ TILDE ESCAPE ANOMALY"}')
+    b = [ord(raw[i]) if i < len(raw) else 0 for i in range(4)]
+    expected = [0x40, 0x0A, 0x1E, 0x0D]
+    labels   = ['@ (File Type)', 'LF 0x0A (Data Sep)', 'RS 0x1E (Rec Sep)', 'CR 0x0D (Seg Term)']
+    for i, (got, exp, lbl) in enumerate(zip(b, expected, labels)):
+        ok = got == exp
+        print(f'  Byte {i} {lbl}: 0x{got:02X}  {"\u2705" if ok else "\u274c expected 0x" + f"{exp:02X}"}')
+    header_ok = all(b[i] == expected[i] for i in range(4))
+    print(f'  Encoding mode:  {mode}')
     if mode == 'tilde_escape':
-        lo = raw[1:3].lower()
-        if lo in ('~0', '~1'):
-            print('  ⚠  Lowercase ~XX detected — bwip-js will NOT resolve lowercase escapes to binary bytes')
-        else:
-            print('  ⚠  Uppercase ~XX detected — these were ASCII escape sequences, not raw binary in the symbol')
+        print(f'  \u274c TILDE-ESCAPE DETECTED — hard FAIL')
+        print(f'     Authentic barcodes encode control bytes as raw binary.')
+        print(f'     ~XX ASCII sequences indicate an incorrectly configured encoder.')
+        print(f'     Common cause: bwip-js with lowercase ~0a/~1e/~0d escapes.')
+    elif mode == 'binary':
+        print(f'  \u2705 Raw binary header — PASS')
+    else:
+        print(f'  \u26a0  Unknown encoding mode')
     return header_ok, mode
 
 def analyse_aamva_version(parsed: dict):
-    """Print AAMVA version header details."""
     print('\n--- AAMVA VERSION HEADER ---')
     if not parsed.get('header_match'):
-        print('  ❌ ANSI header block not found')
+        print('  \u274c ANSI header not found')
         return
-    iin   = parsed['iin']
-    ver   = parsed['aamva_ver']
-    jver  = parsed['juris_ver']
-    nsf   = parsed['num_subfiles']
-    state = AAMVA_IIN_MAP.get(iin, '❌ UNKNOWN IIN (not in AAMVA registry)')
-    valid_ver = 1 <= ver <= 10
-    print(f'  IIN:           {iin} → {state}')
-    print(f'  AAMVA Version: {ver:02d} ({"✅ v" + str(ver) + " (" + _ver_year(ver) + ")" if valid_ver else "❌ invalid version"})')
+    iin  = parsed['iin']
+    ver  = parsed['aamva_ver']
+    jver = parsed['juris_ver']
+    nsf  = parsed['num_subfiles']
+    state = AAMVA_IIN_MAP.get(iin, '\u274c UNKNOWN')
+    print(f'  IIN:           {iin} \u2192 {state}')
+    print(f'  AAMVA Version: {ver:02d} v{ver} ({_ver_year(ver)}) {"\u2705" if 1 <= ver <= 10 else "\u274c invalid"}')
     print(f'  Juris Version: {jver:02d}')
-    print(f'  Subfile Count: {nsf} {"✅" if nsf >= 1 else "❌"}')
-    print(f'  Subfile layout:')
+    print(f'  Subfiles:      {nsf}')
     for sf in parsed['subfiles']:
-        off_ok = '✅' if sf['offset_valid'] else '⚠ offset mismatch'
-        print(f'    {sf["id"]}: declared offset={sf["declared_offset"]} '
-              f'length={sf["declared_length"]} actual_start={sf["actual_start"]} {off_ok}')
-    if not parsed.get('dl_subfile_found'):
-        print('  ❌ DL subfile designator NOT FOUND — required by AAMVA §2.2')
-    else:
-        print('  ✅ DL subfile present')
+        ok = '\u2705' if sf['offset_valid'] else '\u26a0 offset mismatch'
+        print(f'    {sf["id"]}: off={sf["declared_offset"]} len={sf["declared_length"]} '
+              f'actual={sf["actual_start"]} {ok}')
+    icon = '\u2705' if parsed.get('dl_subfile_found') else '\u274c NOT FOUND'
+    print(f'  DL subfile: {icon}')
 
 def _ver_year(v: int) -> str:
-    years = {1:'2000',2:'2003',3:'2005',4:'2006',5:'2008',6:'2011',7:'2012',8:'2009',9:'2013',10:'2016'}
-    return years.get(v, 'unknown')
+    return {1:'2000',2:'2003',3:'2005',4:'2006',5:'2008',
+            6:'2011',7:'2012',8:'2009',9:'2013',10:'2016'}.get(v, '?')
 
 def analyse_mandatory_fields(fields: dict, aamva_ver: int) -> list[str]:
-    """Check all AAMVA-version-mandatory fields are present."""
     print(f'\n--- MANDATORY FIELD CHECK (AAMVA v{aamva_ver:02d}) ---')
-    ver = min(max(aamva_ver, 1), 10)
+    ver  = min(max(aamva_ver, 1), 10)
     mandatory = AAMVA_MANDATORY_FIELDS.get(ver, AAMVA_MANDATORY_FIELDS[8])
     missing = []
     for tag in mandatory:
         present = tag in fields
-        desc = DMV_FIELD_LABELS.get(tag, '')
-        print(f'  {tag} ({desc}): {"✅" if present else "❌ MISSING"}')
+        desc    = DMV_FIELD_LABELS.get(tag, '')
+        print(f'  {tag} ({desc}): {"\u2705" if present else "\u274c MISSING"}')
         if not present:
             missing.append(tag)
     if missing:
-        print(f'  ❌ {len(missing)} mandatory field(s) missing: {", ".join(missing)}')
+        print(f'  \u274c {len(missing)} missing: {", ".join(missing)}')
     else:
-        print(f'  ✅ All {len(mandatory)} mandatory fields present')
+        print(f'  \u2705 All {len(mandatory)} mandatory fields present')
     return missing
 
 def _parse_date(val: str, tag: str) -> datetime | None:
-    """Try MMDDYYYY, then YYYYMMDD, then MMYYYY formats."""
-    val = val.strip()
     for fmt in ('%m%d%Y', '%Y%m%d', '%m%Y'):
         try:
-            return datetime.strptime(val, fmt)
+            return datetime.strptime(val.strip(), fmt)
         except ValueError:
             pass
-    print(f'  {tag}: ❌ unrecognised date format: {repr(val)}')
+    print(f'  {tag}: \u274c unrecognised date format: {repr(val)}')
     return None
 
-def analyse_dates(fields: dict):
+def analyse_dates(fields: dict, aamva_ver: int):
     print('\n--- DATE FIELD VALIDATION ---')
     today = datetime.today()
-    dob_dt = None
-    exp_dt = None
-    iss_dt = None
-    for tag, lbl in [('DBB','DOB'), ('DBD','Issue'), ('DBA','Expiry'),
-                     ('DDB','Under-18/PriorIssue'), ('DDH','Under-18'),
-                     ('DDI','Under-19'), ('DDJ','Under-21')]:
+    iss_dt = exp_dt = dob_dt = None
+    for tag, lbl in [('DBB','DOB'), ('DBD','Issue Date'), ('DBA','Expiry Date'),
+                     ('DDB','Card Revision/Prior-Issue Date'),
+                     ('DDH','Under-18 Until'), ('DDI','Under-19 Until'),
+                     ('DDJ','Under-21 Until')]:
         val = fields.get(tag)
-        if not val:
+        if not val or not val.strip():
             continue
         dt = _parse_date(val, tag)
         if dt is None:
@@ -470,29 +526,29 @@ def analyse_dates(fields: dict):
         if tag == 'DBB':
             dob_dt = dt
             age = (today - dt).days // 365
-            extra = f' → Age: {age} yrs'
+            extra = f' \u2192 Age {age} yrs'
         elif tag == 'DBA':
             exp_dt = dt
-            extra = f' → {"✅ valid" if dt > today else "❌ EXPIRED"}'
+            extra = f' \u2192 {"\u2705 valid" if dt > today else "\u274c EXPIRED"}'
         elif tag == 'DBD':
             iss_dt = dt
+        elif tag == 'DDB':
+            # v5+ DDB = card revision date; v1-v4 DDB = under-18 date
+            role = 'Card Revision' if aamva_ver >= 5 else 'Under-18 Until'
+            extra = f' \u2192 [{role}]'
         print(f'  {tag} ({lbl}): {dt.strftime("%B %d, %Y")}{extra}')
-    # Term length check
     if iss_dt and exp_dt:
-        years = (exp_dt - iss_dt).days / 365.25
-        std = 4 <= years <= 10
-        print(f'  Issue→Expiry term: {years:.1f} years {"✅" if std else "⚠ unusual term"}')
-    # NC birthday-linked expiry
+        yrs = (exp_dt - iss_dt).days / 365.25
+        ok  = 4 <= yrs <= 10
+        print(f'  Term (Issue\u2192Expiry): {yrs:.1f} yrs {"\u2705" if ok else "\u26a0 unusual (<4 or >10 years)"}')
+    # Birthday-linked expiry
     dob_val = fields.get('DBB', '')
     exp_val = fields.get('DBA', '')
     if dob_val and exp_val and len(dob_val) >= 4 and len(exp_val) >= 4:
-        dob_mmdd = dob_val[:4]
-        exp_mmdd = exp_val[:4]
-        if dob_mmdd == exp_mmdd:
-            print(f'  ✅ Expiry ties to birthday ({dob_mmdd} matches)')
+        if dob_val[:4] == exp_val[:4]:
+            print(f'  \u2705 Expiry month/day matches DOB ({dob_val[:4]}) — birthday-linked')
 
 def analyse_field_values(fields: dict):
-    """Validate enum fields: sex, eye, hair, truncation, compliance, ZIP."""
     print('\n--- FIELD VALUE VALIDATION ---')
 
     def chk(tag, valid_set, label):
@@ -500,110 +556,162 @@ def analyse_field_values(fields: dict):
         if not val:
             return
         ok = val in valid_set
-        print(f'  {tag} ({label}): {repr(val)} {"✅" if ok else "❌ invalid (expected " + str(valid_set) + ")"}')
+        print(f'  {tag} ({label}): {repr(val)} {"\u2705" if ok else "\u274c invalid " + repr(sorted(valid_set))}')
 
     chk('DBC', VALID_SEX,        'Sex')
-    chk('DDA', VALID_COMPLIANCE, 'Compliance')
+    chk('DDA', VALID_COMPLIANCE, 'Compliance Type')
     chk('DDE', VALID_TRUNCATION, 'Last Name Trunc')
     chk('DDF', VALID_TRUNCATION, 'First Name Trunc')
     chk('DDG', VALID_TRUNCATION, 'Middle Name Trunc')
     chk('DAY', VALID_EYE_CODES,  'Eye Colour')
     chk('DAZ', VALID_HAIR_CODES, 'Hair Colour')
+    chk('DDK', VALID_ORGAN_DONOR,'Organ Donor')
+    chk('DDL', VALID_VETERAN,    'Veteran Indicator')
 
-    # DAU height — imperial or metric
-    dau = fields.get('DAU', '')
+    # DAU — height format
+    dau = fields.get('DAU', '').strip()
     if dau:
-        if re.match(r'^\d{3} (in|cm)$', dau.strip()):
-            print(f'  DAU (Height): {repr(dau.strip())} ✅')
+        if re.match(r'^\d{3} (in|cm)$', dau):
+            print(f'  DAU (Height): {repr(dau)} \u2705')
         else:
-            print(f'  DAU (Height): {repr(dau.strip())} ❌ expected "NNN in" or "NNN cm"')
+            print(f'  DAU (Height): {repr(dau)} \u274c expected "NNN in" or "NNN cm"')
 
-    # DAK ZIP — fixed 11 chars: 9 digits + 2 trailing spaces or zeros (AAMVA §2.5)
-    # NOTE: do NOT call .strip() here — trailing spaces are mandatory field data.
+    # DAK — ZIP/Postal, fixed 11 chars (AAMVA \u00a72.5)
+    # IMPORTANT: do NOT call .strip() on the raw value — trailing spaces are part of the field.
     dak = fields.get('DAK', '')
     if dak:
         if re.match(r'^\d{9}[\s0]{2}$', dak):
-            print(f'  DAK (ZIP):    {repr(dak)} ✅ (9+2 = 11 chars)')
+            print(f'  DAK (ZIP 9+2): {repr(dak)} \u2705 ({len(dak)} chars)')
+        elif re.match(r'^[A-Z]\d[A-Z] \d[A-Z]\d', dak.strip()):
+            print(f'  DAK (Postal Canadian): {repr(dak)} \u2705')
         else:
-            print(f'  DAK (ZIP):    {repr(dak)} ❌ expected 11-char fixed-width (9 digits + 2 spaces/zeros)')
+            print(f'  DAK: {repr(dak)} \u274c expected 11-char fixed-width (9 digits + 2 pad chars)')
 
-    # DCG country code
+    # DCL — race/ethnicity, fixed 3 chars
+    dcl = fields.get('DCL', '')
+    if dcl:
+        dcl_stripped = dcl.strip()
+        if len(dcl) == 3 and dcl_stripped in VALID_RACE_CODES:
+            print(f'  DCL (Race 3-char): {repr(dcl)} \u2705 ({dcl_stripped})')
+        elif dcl_stripped in VALID_RACE_CODES:
+            print(f'  DCL (Race): {repr(dcl)} \u26a0 valid code but wrong width ({len(dcl)} chars, expected 3)')
+        else:
+            print(f'  DCL (Race): {repr(dcl)} \u274c unknown code. Valid: {sorted(VALID_RACE_CODES)}')
+
+    # DCG — country
     dcg = fields.get('DCG', '').strip()
     if dcg and dcg not in ('USA', 'CAN', 'MEX'):
-        print(f'  DCG (Country): {repr(dcg)} ⚠ unusual country code')
+        print(f'  DCG (Country): {repr(dcg)} \u26a0 unusual country code')
+    elif dcg:
+        print(f'  DCG (Country): {repr(dcg)} \u2705')
 
-def analyse_dck(dck: str):
+    # DCF — document discriminator length
+    dcf = fields.get('DCF', '').strip()
+    if dcf:
+        if 8 <= len(dcf) <= 25:
+            print(f'  DCF (Doc Discriminator): {repr(dcf)} \u2705 (len={len(dcf)})')
+        else:
+            print(f'  DCF (Doc Discriminator): {repr(dcf)} \u26a0 unusual length ({len(dcf)})')
+
+def analyse_dck(dck: str, iin: str = ''):
+    """
+    DCK (Inventory Control / Audit Number) forensics.
+    NC format (IIN 636004): 20 chars
+        [0:12]  = DL number prefix (padded)
+        [12:14] = state code
+        [14:16] = batch/year code
+        [16:18] = manufacturer/vendor code
+        [18:20] = sequence
+    """
     print('\n--- DCK AUDIT NUMBER FORENSICS ---')
-    print(f'  DCK: {dck}  (len={len(dck)})')
-    if len(dck) >= 14:
-        dl_prefix  = dck[:12]
-        state_code = dck[12:14]
-        vendor     = dck[16:18] if len(dck) >= 18 else '?'
-        seq        = dck[18:20] if len(dck) >= 20 else '?'
-        vendor_map = {'TL':'Idemia/L1','DL':'Digimarc','HO':'HID Global','DM':'DataCard'}
-        print(f'  DL# prefix:  {dl_prefix}')
-        print(f'  State code:  {state_code}')
-        if len(dck) >= 16:
-            print(f'  Batch code:  {dck[14:16]}')
-        print(f'  Vendor code: {vendor} {"(" + vendor_map.get(vendor, "unknown") + ")"}')
-        print(f'  Sequence:    {seq}')
+    dck = dck.strip()
+    print(f'  DCK raw: {repr(dck)}  (len={len(dck)})')
+    if len(dck) < 12:
+        print('  \u26a0  DCK shorter than expected (min 12 chars)')
+        return
+    dl_prefix  = dck[:12]
+    state_code = dck[12:14] if len(dck) >= 14 else ''
+    batch_code = dck[14:16] if len(dck) >= 16 else ''
+    vendor     = dck[16:18] if len(dck) >= 18 else ''
+    sequence   = dck[18:20] if len(dck) >= 20 else ''
+    print(f'  [00:12] DL# prefix:    {dl_prefix}')
+    if state_code:
+        print(f'  [12:14] State code:    {state_code}')
+    if batch_code:
+        print(f'  [14:16] Batch code:    {batch_code}')
+    if vendor:
+        vendor_name = DCK_VENDOR_MAP.get(vendor, 'unknown')
+        print(f'  [16:18] Vendor code:   {vendor} ({vendor_name})')
+    if sequence:
+        print(f'  [18:20] Sequence:      {sequence}')
+    # Cross-check DL# prefix against DAQ
+    return dl_prefix
 
-def analyse_jurisdiction_subfile(fields: dict, iin: str):
-    """Print all jurisdiction-extension (Zxx) fields — any state."""
-    print('\n--- JURISDICTION SUBFILE (Zxx) ---')
-    state = AAMVA_IIN_MAP.get(iin, 'Unknown')
-    print(f'  State: {state}')
-    z_fields = {k: v for k, v in fields.items() if k.startswith('Z')}
-    if not z_fields:
-        print('  (none found)')
+def analyse_dck_vs_daq(dck_prefix: str, daq: str):
+    if not dck_prefix or not daq:
+        return
+    daq_stripped = daq.strip().lstrip('0')
+    dck_stripped = dck_prefix.strip().lstrip('0')
+    if daq_stripped == dck_stripped:
+        print(f'  \u2705 DCK prefix matches DAQ ({daq_stripped})')
     else:
-        for tag, val in sorted(z_fields.items()):
-            print(f'  {tag}: {repr(val)}')
+        print(f'  \u274c DCK prefix MISMATCH: DAQ={repr(daq)} DCK_prefix={repr(dck_prefix)}')
+
+def analyse_zn_subfile(fields: dict, iin: str):
+    print('\n--- JURISDICTION SUBFILE FORENSICS ---')
+    state = AAMVA_IIN_MAP.get(iin, 'Unknown')
+    print(f'  Issuing State: {state} (IIN {iin})')
+    z_fields = {k: v for k, v in sorted(fields.items()) if k.startswith('Z')}
+    if not z_fields:
+        print('  (no jurisdiction fields found)')
+        return
+    for tag, val in z_fields.items():
+        desc = DMV_FIELD_LABELS.get(tag, NC_ZN_FIELDS.get(tag, 'Unknown jurisdiction field'))
+        # NC-specific validations
+        note = ''
+        if tag == 'ZNA':
+            note = '(Replacement)' if val.strip() else '\u2705 (Original document)'
+        elif tag == 'ZNB':
+            note = '(Limited-term)' if val.strip() else '\u2705 (Full-term)'
+        elif tag == 'ZNC':
+            note = '\u2705 Under-21' if val.strip() == '1' else ('\u2705 21+' if val.strip() == '0' else '\u26a0')
+        elif tag == 'ZND':
+            note = ('\u2705 Non-resident CDL' if val.strip() == 'Y'
+                    else ('\u2705 Not CDL' if val.strip() == 'N' else '\u26a0'))
+        print(f'  {tag}: {repr(val):<12}  {desc}  {note}')
 
 def run_forensics(raw: str, label: str) -> dict:
     print(f"\n{'='*60}\nFORENSIC ANALYSIS: {label.upper()}\n{'='*60}")
-
-    # 1. Detect encoding mode BEFORE unescape
-    mode = detect_encoding_mode(raw)
+    mode       = detect_encoding_mode(raw)
     normalised = unescape_tilde(raw) if '~' in raw else raw
-
-    # 2. Header bytes (on normalised)
     header_ok, enc_mode = analyse_header_bytes(normalised, label)
-
-    # 3. Full subfile parse
     parsed = parse_subfiles(normalised)
     analyse_aamva_version(parsed)
-
-    # 4. Fields
     fields = parsed['fields']
+
     print('\n--- ALL PARSED FIELDS ---')
     for tag, val in sorted(fields.items()):
         desc = DMV_FIELD_LABELS.get(tag, '')
-        print(f'  {tag}: {repr(val):<32}  {desc}')
+        print(f'  {tag}: {repr(val):<34}  {desc}')
 
-    # 5. Mandatory field check
     missing = analyse_mandatory_fields(fields, parsed['aamva_ver'] or 8)
-
-    # 6. Date validation
-    analyse_dates(fields)
-
-    # 7. Field value validation
+    analyse_dates(fields, parsed['aamva_ver'] or 8)
     analyse_field_values(fields)
 
-    # 8. DCK
+    dck_prefix = None
     if 'DCK' in fields:
-        analyse_dck(fields['DCK'])
+        dck_prefix = analyse_dck(fields['DCK'], parsed['iin'])
+        analyse_dck_vs_daq(dck_prefix, fields.get('DAQ', ''))
 
-    # 9. Jurisdiction subfile
-    analyse_jurisdiction_subfile(fields, parsed['iin'])
+    analyse_zn_subfile(fields, parsed['iin'])
 
     return {
-        'fields':           fields,
-        'header_ok':        header_ok,
-        'normalised':       normalised,
-        'parsed':           parsed,
-        'missing_mandatory':missing,
-        'encoding_mode':    mode,
+        'fields':            fields,
+        'header_ok':         header_ok,
+        'normalised':        normalised,
+        'parsed':            parsed,
+        'missing_mandatory': missing,
+        'encoding_mode':     mode,
     }
 
 
@@ -613,16 +721,11 @@ def run_forensics(raw: str, label: str) -> dict:
 
 def compare_cards(r1: dict, r2: dict):
     print(f"\n{'='*60}\nFIELD COMPARISON: CARD1 vs CARD2\n{'='*60}")
-
-    # Flag encoding mode mismatch first
     if r1['encoding_mode'] != r2['encoding_mode']:
-        print(f'  ⚠  ENCODING MODE MISMATCH:')
+        print(f'  \u26a0  ENCODING MODE MISMATCH')
         print(f'     Card1: {r1["encoding_mode"]}')
-        print(f'     Card2: {r2["encoding_mode"]}  ← this is the anomaly')
-        print(f'     Implication: Card2 had ~XX ASCII escapes in the barcode symbol instead of')
-        print(f'     binary bytes. After normalisation fields match, but the raw symbol differs.')
+        print(f'     Card2: {r2["encoding_mode"]}')
         print()
-
     f1, f2 = r1['fields'], r2['fields']
     all_tags = sorted(set(list(f1) + list(f2)))
     matches = mismatches = 0
@@ -631,83 +734,108 @@ def compare_cards(r1: dict, r2: dict):
         v2 = f2.get(tag, '<MISSING>')
         if v1 == v2:
             matches += 1
-            print(f'  {tag}: ✅ MATCH   {repr(v1)}')
+            print(f'  {tag}: \u2705 MATCH   {repr(v1)}')
         else:
             mismatches += 1
-            print(f'  {tag}: ❌ DIFFER')
+            print(f'  {tag}: \u274c DIFFER')
             print(f'       C1: {repr(v1)}')
             print(f'       C2: {repr(v2)}')
-    print(f'\n  Totals: {matches} matching, {mismatches} differing')
+    print(f'\n  {matches} matching, {mismatches} differing')
 
 
 def authenticity_verdict(r1: dict, r2: dict):
     print(f"\n{'='*60}\nAUTHENTICITY VERDICT\n{'='*60}")
+    for card_label, r in [('CARD1', r1), ('CARD2', r2)]:
+        print(f'\n  --- {card_label} ({r["encoding_mode"].upper()}) ---')
+        p  = r['parsed']
+        f  = r['fields']
+        iin= p.get('iin', '')
+        ver= p.get('aamva_ver', 0)
+        state_name = AAMVA_IIN_MAP.get(iin, 'Unknown')
+        state_code = f.get('DAJ', '').strip()
 
-    p1  = r1['parsed']
-    f1  = r1['fields']
-    iin = p1.get('iin', '')
-    ver = p1.get('aamva_ver', 0)
-    state_name = AAMVA_IIN_MAP.get(iin, 'Unknown')
-    state_code = f1.get('DAJ', '').strip()
+        checks = [
+            # —— CRITICAL: encoding must be binary, not tilde-escaped ——
+            ('Encoding: raw binary header (0x40 0x0A 0x1E 0x0D)',
+             r['header_ok'] and r['encoding_mode'] == 'binary'),
 
-    checks = [
-        # Header
-        ('Binary header bytes (0x40 0x0A 0x1E 0x0D)',
-         r1['header_ok']),
-        ('IIN registered in AAMVA registry',
-         iin in AAMVA_IIN_MAP),
-        ('IIN state matches DAJ field',
-         state_name.lower() == _state_abbr_to_name(state_code).lower()
-         if state_code else False),
-        ('AAMVA version 01–10 (valid range)',
-         1 <= ver <= 10),
-        ('DL subfile present',
-         p1.get('dl_subfile_found', False)),
-        ('Subfile byte-range offsets valid',
-         p1.get('offsets_valid', False)),
-        ('All mandatory fields present',
-         len(r1['missing_mandatory']) == 0),
-        ('DBC sex code valid (1/2/9)',
-         f1.get('DBC','').strip() in VALID_SEX),
-        ('DAY eye code valid',
-         f1.get('DAY','').strip() in VALID_EYE_CODES),
-        ('DDA compliance type valid (F/N/U)',
-         f1.get('DDA','').strip() in VALID_COMPLIANCE if 'DDA' in f1 else True),
-        ('DBA expiry in future (not expired)',
-         (lambda v: _parse_date(v,'DBA') is not None and _parse_date(v,'DBA') > datetime.today())(f1.get('DBA',''))),
-        ('DAK ZIP format (11 chars)',
-         bool(re.match(r'^\d{9}[\s0]{2}$', f1.get('DAK','')))),
-        ('DCF document discriminator present',
-         'DCF' in f1),
-        ('DCG country code (USA/CAN/MEX)',
-         f1.get('DCG','').strip() in ('USA','CAN','MEX')),
-    ]
+            # Header structure
+            ('IIN registered in AAMVA registry',
+             iin in AAMVA_IIN_MAP),
+            ('IIN state matches DAJ field',
+             state_name.lower() == _state_abbr_to_name(state_code).lower() if state_code else False),
+            ('AAMVA version 01–10',
+             1 <= ver <= 10),
+            ('DL subfile present',
+             p.get('dl_subfile_found', False)),
+            ('Subfile byte-range offsets valid',
+             p.get('offsets_valid', False)),
 
-    passed = failed = 0
-    for lbl, result in checks:
-        icon = '✅ PASS' if result else '❌ FAIL'
-        (passed if result else failed).__class__  # just for structure
-        if result:
-            passed += 1
+            # Mandatory fields
+            ('All mandatory fields present',
+             len(r['missing_mandatory']) == 0),
+
+            # Identity / physical
+            ('DBC sex code valid (1/2/9)',
+             f.get('DBC','').strip() in VALID_SEX),
+            ('DAY eye colour code valid',
+             f.get('DAY','').strip() in VALID_EYE_CODES),
+            ('DAZ hair colour code valid',
+             f.get('DAZ','').strip() in VALID_HAIR_CODES if 'DAZ' in f else True),
+            ('DAU height format (NNN in/cm)',
+             bool(re.match(r'^\d{3} (in|cm)$', f.get('DAU','').strip()))),
+
+            # Dates
+            ('DBA expiry date in future',
+             (lambda v: bool(v) and _parse_date(v,'DBA') is not None
+              and _parse_date(v,'DBA') > datetime.today())(f.get('DBA',''))),
+
+            # Address
+            ('DAK ZIP format (11-char fixed-width)',
+             bool(re.match(r'^\d{9}[\s0]{2}$', f.get('DAK','')))),
+
+            # Document metadata
+            ('DCF document discriminator present',
+             bool(f.get('DCF','').strip())),
+            ('DCG country code (USA/CAN/MEX)',
+             f.get('DCG','').strip() in ('USA','CAN','MEX')),
+            ('DDA compliance type valid (F/N/U)',
+             f.get('DDA','').strip() in VALID_COMPLIANCE if 'DDA' in f else True),
+
+            # Truncation
+            ('DDE last-name truncation flag valid',
+             f.get('DDE','').strip() in VALID_TRUNCATION if 'DDE' in f else True),
+            ('DDF first-name truncation flag valid',
+             f.get('DDF','').strip() in VALID_TRUNCATION if 'DDF' in f else True),
+            ('DDG middle-name truncation flag valid',
+             f.get('DDG','').strip() in VALID_TRUNCATION if 'DDG' in f else True),
+
+            # Optional fields present in reference barcode
+            ('DCL race/ethnicity 3-char width',
+             len(f.get('DCL','')) == 3 if 'DCL' in f else True),
+            ('DCK audit number present',
+             bool(f.get('DCK','').strip())),
+            ('DDK organ donor valid (0/1)',
+             f.get('DDK','').strip() in VALID_ORGAN_DONOR if 'DDK' in f else True),
+        ]
+
+        passed = failed = 0
+        for lbl, result in checks:
+            icon = '\u2705 PASS' if result else '\u274c FAIL'
+            if result:
+                passed += 1
+            else:
+                failed += 1
+            print(f'    {icon}  {lbl}')
+
+        total = len(checks)
+        print(f'\n    Result: {passed}/{total} checks passed')
+        if failed == 0:
+            print(f'    \u2705 {card_label} STRUCTURALLY AUTHENTIC [{state_name}, AAMVA v{ver:02d}]')
+        elif r['encoding_mode'] == 'tilde_escape':
+            print(f'    \u274c {card_label} FAILED — tilde-escape encoding (not a valid AAMVA barcode)')
         else:
-            failed += 1
-        print(f'  {icon}  {lbl}')
-
-    print(f'\n  Card1 result: {passed}/{len(checks)} checks passed')
-    if failed == 0:
-        print(f'  ✅ CARD1 STRUCTURALLY AUTHENTIC [{state_name}, AAMVA v{ver:02d}]')
-    else:
-        print(f'  ⚠  {failed} check(s) FAILED')
-
-    # Card2 encoding anomaly
-    print('\n  Card2 Encoding Verdict:')
-    if not r2['header_ok']:
-        print('  ❌ Card2 binary header ABSENT — ~XX ASCII escape sequences found in barcode symbol')
-        print('     Cause: bwip-js received lowercase escape sequences (~0a, ~1e, ~0d)')
-        print('     bwip-js only resolves UPPERCASE ~0A, ~1E, ~0D to binary bytes')
-        print('     Fix applied in aam-project: escapeAAMVAForBwipjs() now uses .toUpperCase()')
-    else:
-        print('  ✅ Card2 binary header correct')
+            print(f'    \u26a0  {card_label} PARTIAL — {failed} check(s) failed')
 
 
 def _state_abbr_to_name(abbr: str) -> str:
@@ -732,24 +860,19 @@ def _state_abbr_to_name(abbr: str) -> str:
 # ===========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='AAMVA PDF417 Forensic Tool v2')
+    parser = argparse.ArgumentParser(description='AAMVA PDF417 Forensic Tool v3')
     parser.add_argument('--card1', default='card1.jpg')
     parser.add_argument('--card2', default='card2.jpg')
     parser.add_argument('--raw-only', action='store_true')
     args = parser.parse_args()
 
-    print('╔══════════════════════════════════════════════════════════╗')
-    print('║    AAMVA PDF417 BARCODE FORENSIC TOOL  v2.0              ║')
-    print('║    All 50 states · AAMVA v01–v10 · Full spec compliance  ║')
-    print('╚══════════════════════════════════════════════════════════╝')
+    print('\u2554' + '\u2550' * 58 + '\u2557')
+    print('\u2551  AAMVA PDF417 BARCODE FORENSIC TOOL  v3.0                \u2551')
+    print('\u2551  All 50 states \u00b7 AAMVA v01\u201310 \u00b7 Tilde-escape = FAIL       \u2551')
+    print('\u255a' + '\u2550' * 58 + '\u255d')
 
     if args.raw_only:
-        print('\n[mode] Using embedded raw strings (--raw-only)')
         raw1, raw2 = CARD1_RAW_EMBEDDED, CARD2_RAW_EMBEDDED
-        print('\n--- RAW OUTPUT (card1) ---')
-        print(repr(raw1))
-        print('\n--- RAW OUTPUT (card2) ---')
-        print(repr(raw2))
     else:
         raw1 = decode_image(args.card1, 'card1') or CARD1_RAW_EMBEDDED
         raw2 = decode_image(args.card2, 'card2') or CARD2_RAW_EMBEDDED

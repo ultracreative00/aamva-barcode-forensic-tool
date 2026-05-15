@@ -324,10 +324,39 @@ def parse_subfiles(raw: str) -> dict:
     return result
 
 def _parse_fields(text: str) -> dict:
-    """Extract 3-char AAMVA field tags from a block of text."""
+    """
+    Extract 3-char AAMVA field tags from a subfile block.
+
+    FIX 1 — Subfile designator prefix:
+      Each subfile block starts with its 2-char type ID (e.g. "DL", "ZN")
+      immediately followed by the first field tag (e.g. "DAQ...").
+      The combined string "DLDAQ..." would be split as tag="DLD", value="AQ..."
+      which creates a phantom field and loses DAQ entirely.
+      Solution: strip the leading 2-char subfile designator before iterating.
+
+    FIX 2 — Preserve trailing spaces in fixed-width fields:
+      AAMVA §2.5 mandates fixed-width fields like DAK (11 chars = 9-digit ZIP
+      + 2 trailing spaces) and DCL (3 chars = code + padding spaces).
+      The previous line.strip() silently removed those spaces, causing
+      DAK='272622119  ' to become '272622119' (9 chars) and failing the
+      11-char ZIP validation, and DCL='U  ' to become 'U' (1 char).
+      Solution: only strip null bytes and line-ending characters (\r \n),
+      never strip spaces which are part of the field value.
+    """
     fields: dict[str, str] = {}
+
+    # Strip the leading 2-char subfile type designator (e.g. "DL", "ZN").
+    # A subfile block always starts with its 2-char ID directly followed by
+    # the first 3-char field tag — e.g. "DLDAQ...", "ZNDDE...".
+    # We detect this by checking that the first 5 chars match [A-Z]{2}[A-Z]{2}[A-Z0-9].
+    if len(text) >= 5 and re.match(r'^[A-Z]{2}[A-Z]{2}[A-Z0-9]', text):
+        text = text[2:]
+
     for line in re.split(r'[\n\r\x1c\x1d\x1e]', text):
-        line = line.strip()
+        # Strip only null bytes and line-ending chars — NOT spaces.
+        # Trailing spaces are significant data in fixed-width AAMVA fields
+        # such as DAK (ZIP, 11 chars) and DCL (Race/Ethnicity, 3 chars).
+        line = line.lstrip('\x00').rstrip('\r\n')
         if len(line) >= 3:
             tag = line[:3]
             val = line[3:]
@@ -489,13 +518,14 @@ def analyse_field_values(fields: dict):
         else:
             print(f'  DAU (Height): {repr(dau.strip())} ❌ expected "NNN in" or "NNN cm"')
 
-    # DAK ZIP — 11 chars (9 digits + 2 trailing spaces or zeros)
+    # DAK ZIP — fixed 11 chars: 9 digits + 2 trailing spaces or zeros (AAMVA §2.5)
+    # NOTE: do NOT call .strip() here — trailing spaces are mandatory field data.
     dak = fields.get('DAK', '')
     if dak:
         if re.match(r'^\d{9}[\s0]{2}$', dak):
             print(f'  DAK (ZIP):    {repr(dak)} ✅ (9+2 = 11 chars)')
         else:
-            print(f'  DAK (ZIP):    {repr(dak)} ⚠ expected 11-char MMDDCCCCCC format or 9-digit+2-space ZIP')
+            print(f'  DAK (ZIP):    {repr(dak)} ❌ expected 11-char fixed-width (9 digits + 2 spaces/zeros)')
 
     # DCG country code
     dcg = fields.get('DCG', '').strip()
